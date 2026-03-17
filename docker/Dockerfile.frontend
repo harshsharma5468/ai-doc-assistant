@@ -1,0 +1,40 @@
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install -r requirements.txt
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY --from=builder /install /usr/local
+
+RUN groupadd -r streamlit && useradd -r -g streamlit streamlit
+
+WORKDIR /app
+COPY app.py .
+
+RUN mkdir -p /home/streamlit/.streamlit && \
+    chown -R streamlit:streamlit /app /home/streamlit
+
+USER streamlit
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--server.enableXsrfProtection=false", \
+     "--browser.gatherUsageStats=false"]

@@ -1,0 +1,193 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Document Assistant — Full Stack
+# Services: backend · frontend · redis · chroma · prometheus · grafana · nginx
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+x-logging: &default-logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+networks:
+  app-net:
+    driver: bridge
+  monitoring-net:
+    driver: bridge
+
+volumes:
+  vector_data:
+  upload_data:
+  redis_data:
+  chroma_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ── Backend API ─────────────────────────────────────────────────────────────
+  backend:
+    <<: [*restart-policy, *default-logging]
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+      target: runtime
+    image: ai-doc-assistant/backend:latest
+    container_name: aidoc-backend
+    env_file:
+      - ../.env
+    environment:
+      - PYTHONPATH=/app
+      - VECTOR_STORE_PATH=/app/data/vectorstore
+      - UPLOAD_DIR=/app/data/uploads
+      - REDIS_URL=redis://redis:6379/0
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+    volumes:
+      - vector_data:/app/data/vectorstore
+      - upload_data:/app/data/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    networks:
+      - app-net
+      - monitoring-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+
+  # ── Streamlit Frontend ──────────────────────────────────────────────────────
+  frontend:
+    <<: [*restart-policy, *default-logging]
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      target: runtime
+    image: ai-doc-assistant/frontend:latest
+    container_name: aidoc-frontend
+    environment:
+      - API_BASE_URL=http://backend:8000/api/v1
+      - HEALTH_URL=http://backend:8000/health
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Redis (conversation memory + caching) ───────────────────────────────────
+  redis:
+    <<: [*restart-policy, *default-logging]
+    image: redis:7.2-alpine
+    container_name: aidoc-redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save 60 1
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 600M
+
+  # ── ChromaDB (alternative vector store) ────────────────────────────────────
+  chroma:
+    <<: [*restart-policy, *default-logging]
+    image: chromadb/chroma:0.5.0
+    container_name: aidoc-chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/data
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      - chroma_data:/chroma/data
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  prometheus:
+    <<: [*restart-policy, *default-logging]
+    image: prom/prometheus:v2.52.0
+    container_name: aidoc-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring-net
+    ports:
+      - "9090:9090"
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  grafana:
+    <<: [*restart-policy, *default-logging]
+    image: grafana/grafana:10.4.0
+    container_name: aidoc-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_HTTP_PORT=3000
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - monitoring-net
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  # ── Nginx reverse proxy ─────────────────────────────────────────────────────
+  nginx:
+    <<: [*restart-policy, *default-logging]
+    image: nginx:1.26-alpine
+    container_name: aidoc-nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - app-net
