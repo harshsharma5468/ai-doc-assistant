@@ -34,15 +34,24 @@ def mock_settings(tmp_path_factory):
 @pytest.fixture(scope="session")
 def app(mock_settings):
     """Build app with mocked LLM and embeddings."""
+    # FIX 1: Import the real class first so we can pass spec= to MagicMock.
+    # This prevents pydantic v1 from receiving a bare MagicMock as a field
+    # type annotation on NamespacedRetriever(BaseRetriever), which caused:
+    #   RuntimeError: error checking inheritance of <MagicMock ...> (type: MagicMock)
+    from app.services.vector_store import VectorStoreService as _RealVS
+
     with (
         patch("app.services.llm_factory.build_llm_and_embeddings") as mock_factory,
-        patch("app.services.vector_store.VectorStoreService") as MockVS,
+        # FIX 2: Patch where VectorStoreService is *used* (rag_pipeline imports
+        # it at module level), not just where it is defined. Also pass spec= so
+        # issubclass() checks inside pydantic v1 validators work correctly.
+        patch("app.services.rag_pipeline.VectorStoreService", spec=_RealVS) as MockVS,
     ):
         mock_llm = MagicMock()
         mock_embeddings = MagicMock()
         mock_factory.return_value = (mock_llm, mock_embeddings)
 
-        mock_vs_instance = MagicMock()
+        mock_vs_instance = MagicMock(spec=_RealVS)
         mock_vs_instance.get_store_stats = AsyncMock(return_value={"total_vectors": 0})
         mock_vs_instance.add_documents = AsyncMock(return_value=["chunk-1"])
         mock_vs_instance.similarity_search = AsyncMock(return_value=[])
@@ -111,9 +120,14 @@ class TestDocumentUpload:
 # ── Chat Tests ────────────────────────────────────────────────────────────────
 
 class TestChat:
-    @patch("app.api.chat.chat")
+    # FIX 3: The original had @patch("app.api.chat.chat") which injected a mock
+    # as the first positional argument, pushing `client` out. Since this test
+    # doesn't actually need to intercept the chat coroutine (it's testing
+    # request *validation* — FastAPI rejects the empty message before routing),
+    # the patch decorator is simply removed. TestClient + pydantic validation
+    # happen synchronously with no await needed.
     def test_chat_request_validation(self, client):
-        # Empty message should fail
+        # Empty message should be rejected by pydantic validation (422)
         r = client.post(
             "/api/v1/chat/",
             json={"message": "", "namespace": "default"},
