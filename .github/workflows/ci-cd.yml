@@ -231,7 +231,6 @@ jobs:
     if: github.ref == 'refs/heads/develop'
     environment:
       name: staging
-      url: http://${{ secrets.STAGING_HOST }}
 
     steps:
       - uses: actions/checkout@v4
@@ -272,7 +271,6 @@ jobs:
     if: github.event_name == 'release'
     environment:
       name: production
-      url: https://${{ secrets.PRODUCTION_DOMAIN }}
 
     steps:
       - uses: actions/checkout@v4
