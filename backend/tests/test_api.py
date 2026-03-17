@@ -1,17 +1,15 @@
 """
 Integration + unit tests for the RAG API.
-Uses pytest-asyncio with httpx for async client testing.
+Uses FastAPI TestClient (synchronous) for all HTTP tests.
 """
 from __future__ import annotations
 
-import io
-import json
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from httpx import AsyncClient
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -31,40 +29,100 @@ def mock_settings(tmp_path_factory):
         yield
 
 
+# Module-level list keeps patch objects alive for the whole session.
+# If patches lived inside a `with` block that `yield`s, the context managers
+# would exit (undoing the patches) as soon as the first test ran.
+_session_patches: list = []
+
+
 @pytest.fixture(scope="session")
 def app(mock_settings):
-    """Build app with mocked LLM and embeddings."""
-    # FIX 1: Import the real class first so we can pass spec= to MagicMock.
-    # This prevents pydantic v1 from receiving a bare MagicMock as a field
-    # type annotation on NamespacedRetriever(BaseRetriever), which caused:
-    #   RuntimeError: error checking inheritance of <MagicMock ...> (type: MagicMock)
+    """
+    Build the FastAPI app once for the whole test session.
+
+    Patching strategy
+    -----------------
+    * ``app.services.rag_pipeline.VectorStoreService`` — patched *where it is
+      used at class-definition time* (NamespacedRetriever field annotation),
+      not just where it is defined.  ``spec=_RealVS`` is mandatory: pydantic
+      v1's ``find_validators`` calls ``issubclass()`` on the field type; a bare
+      MagicMock is not a class and raises RuntimeError.
+    * ``app.services.llm_factory.build_llm_and_embeddings`` — prevents any
+      real API calls during import / app construction.
+    * FastAPI ``dependency_overrides`` — injects mock service instances into
+      every route that uses Depends(), bypassing startup-guard assertions.
+    """
     from app.services.vector_store import VectorStoreService as _RealVS
 
-    with (
-        patch("app.services.llm_factory.build_llm_and_embeddings") as mock_factory,
-        # FIX 2: Patch where VectorStoreService is *used* (rag_pipeline imports
-        # it at module level), not just where it is defined. Also pass spec= so
-        # issubclass() checks inside pydantic v1 validators work correctly.
-        patch("app.services.rag_pipeline.VectorStoreService", spec=_RealVS) as MockVS,
-    ):
-        mock_llm = MagicMock()
-        mock_embeddings = MagicMock()
-        mock_factory.return_value = (mock_llm, mock_embeddings)
+    # Start patches manually so they stay alive for the full session scope.
+    p_factory = patch("app.services.llm_factory.build_llm_and_embeddings")
+    p_vs = patch("app.services.rag_pipeline.VectorStoreService", spec=_RealVS)
 
-        mock_vs_instance = MagicMock(spec=_RealVS)
-        mock_vs_instance.get_store_stats = AsyncMock(return_value={"total_vectors": 0})
-        mock_vs_instance.add_documents = AsyncMock(return_value=["chunk-1"])
-        mock_vs_instance.similarity_search = AsyncMock(return_value=[])
-        mock_vs_instance.mmr_search = AsyncMock(return_value=[])
-        MockVS.return_value = mock_vs_instance
+    mock_factory = p_factory.start()
+    MockVS = p_vs.start()
 
-        from app.main import create_app
-        return create_app()
+    _session_patches.extend([p_factory, p_vs])
+
+    mock_llm = MagicMock()
+    mock_embeddings = MagicMock()
+    mock_factory.return_value = (mock_llm, mock_embeddings)
+
+    mock_vs_instance = MagicMock(spec=_RealVS)
+    mock_vs_instance.get_store_stats = AsyncMock(return_value={"total_vectors": 0})
+    mock_vs_instance.add_documents = AsyncMock(return_value=["chunk-1"])
+    mock_vs_instance.similarity_search = AsyncMock(return_value=[])
+    mock_vs_instance.mmr_search = AsyncMock(return_value=[])
+    MockVS.return_value = mock_vs_instance
+
+    from app.main import create_app
+    _app = create_app()
+
+    # Build mock services
+    from app.services.rag_pipeline import RAGPipeline
+    from app.services.evaluation import EvaluationService
+
+    mock_rag = MagicMock(spec=RAGPipeline)
+    mock_rag.query = AsyncMock(return_value=MagicMock(
+        answer="ok",
+        sources=[],
+        session_id="s1",
+        evaluation=None,
+        processing_time=0.1,
+    ))
+    # Raise 404 for any session ID — matches test_chat_history_not_found
+    def _get_history(session_id: str):
+        raise HTTPException(status_code=404, detail="Session not found")
+    mock_rag.get_chat_history = MagicMock(side_effect=_get_history)
+    mock_rag.clear_session = MagicMock()
+
+    mock_eval = MagicMock(spec=EvaluationService)
+
+    # Wire dependency overrides
+    from app.core.dependencies import get_eval_service, get_rag_pipeline, get_vector_store
+    _app.dependency_overrides[get_vector_store] = lambda: mock_vs_instance
+    _app.dependency_overrides[get_rag_pipeline] = lambda: mock_rag
+    _app.dependency_overrides[get_eval_service] = lambda: mock_eval
+
+    yield _app
+
+    # Teardown: clear overrides and stop patches
+    _app.dependency_overrides.clear()
+    for p in reversed(_session_patches):
+        p.stop()
+    _session_patches.clear()
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def client(app):
-    return TestClient(app)
+    """
+    Session-scoped TestClient.
+
+    Using it as a context manager triggers the app's lifespan (startup /
+    shutdown) exactly once for the whole session, matching the session-scoped
+    ``app`` fixture and avoiding repeated startup overhead.
+    """
+    with TestClient(app, raise_server_exceptions=False) as c:
+        yield c
 
 
 # ── Health Tests ──────────────────────────────────────────────────────────────
@@ -120,14 +178,10 @@ class TestDocumentUpload:
 # ── Chat Tests ────────────────────────────────────────────────────────────────
 
 class TestChat:
-    # FIX 3: The original had @patch("app.api.chat.chat") which injected a mock
-    # as the first positional argument, pushing `client` out. Since this test
-    # doesn't actually need to intercept the chat coroutine (it's testing
-    # request *validation* — FastAPI rejects the empty message before routing),
-    # the patch decorator is simply removed. TestClient + pydantic validation
-    # happen synchronously with no await needed.
     def test_chat_request_validation(self, client):
-        # Empty message should be rejected by pydantic validation (422)
+        # Empty message is rejected by pydantic field validation → 422.
+        # FastAPI rejects the payload before any handler or dependency runs,
+        # so no mock patching of the chat handler is needed.
         r = client.post(
             "/api/v1/chat/",
             json={"message": "", "namespace": "default"},
@@ -135,10 +189,12 @@ class TestChat:
         assert r.status_code == 422
 
     def test_chat_history_not_found(self, client):
+        # mock_rag.get_chat_history raises HTTPException(404) for all session IDs.
         r = client.get("/api/v1/chat/nonexistent-session/history")
         assert r.status_code == 404
 
     def test_clear_nonexistent_session(self, client):
+        # DELETE is idempotent; 204 is correct even for unknown sessions.
         r = client.delete("/api/v1/chat/nonexistent-session")
         assert r.status_code == 204
 
@@ -174,8 +230,7 @@ class TestRAGPipeline:
                 },
             )
         ]
-        scores = [0.85]
-        sources = RAGPipeline._build_sources(docs, scores)
+        sources = RAGPipeline._build_sources(docs, [0.85])
         assert len(sources) == 1
         assert sources[0].document_id == "doc-1"
         assert sources[0].relevance_score == 0.85
@@ -189,7 +244,7 @@ class TestRAGPipeline:
             Document(page_content="B", metadata={"chunk_id": "same", "document_id": "d1", "filename": "f.pdf"}),
         ]
         sources = RAGPipeline._build_sources(docs, [0.9, 0.8])
-        assert len(sources) == 1  # deduplicated
+        assert len(sources) == 1
 
 
 # ── Evaluation Unit Tests ─────────────────────────────────────────────────────
@@ -230,17 +285,16 @@ class TestDocumentProcessor:
         assert id1 != id3
 
     def test_unsupported_extension_raises(self):
-        import asyncio
         from pathlib import Path
         from app.services.document_processor import DocumentProcessor
 
-        mock_vs = MagicMock()
-        processor = DocumentProcessor(vector_store=mock_vs)
+        processor = DocumentProcessor(vector_store=MagicMock())
 
+        # asyncio.run() is correct for Python 3.10+.
+        # asyncio.get_event_loop().run_until_complete() is deprecated and errors
+        # in Python 3.12 when there is no running event loop.
         with pytest.raises(ValueError, match="Unsupported file type"):
-            asyncio.get_event_loop().run_until_complete(
-                processor._load(Path("test.xyz"))
-            )
+            asyncio.run(processor._load(Path("test.xyz")))
 
 
 # ── Prometheus Metrics Tests ──────────────────────────────────────────────────
