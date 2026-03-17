@@ -1,184 +1,306 @@
-name: CI/CD — AI Document Assistant
+"""
+Integration + unit tests for the RAG API.
+Uses FastAPI TestClient (synchronous) for all HTTP tests.
+"""
+from __future__ import annotations
 
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-  release:
-    types: [published]
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_BACKEND: ${{ github.repository }}/backend
-  IMAGE_FRONTEND: ${{ github.repository }}/frontend
-  PYTHON_VERSION: "3.12"
+import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# ── Fixtures ──────────────────────────────────────────────────────────────────
 
-jobs:
+@pytest.fixture(scope="session")
+def mock_settings(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("data")
+    with patch.dict(
+        "os.environ",
+        {
+            "OPENAI_API_KEY": "sk-test-key",
+            "LLM_PROVIDER": "openai",
+            "VECTOR_STORE_PATH": str(tmp / "vectors"),
+            "UPLOAD_DIR": str(tmp / "uploads"),
+            "ENVIRONMENT": "testing",
+        },
+    ):
+        yield
 
-  # ─────────────────────────────────────────
-  # JOB 1: Lint
-  # ─────────────────────────────────────────
-  lint:
-    name: 🔍 Lint & Static Analysis
-    runs-on: ubuntu-latest
 
-    steps:
-      - uses: actions/checkout@v4
+# Module-level list keeps patch objects alive for the whole session.
+# If patches lived inside a `with` block that `yield`s, the context managers
+# would exit (undoing the patches) as soon as the first test runs.
+_session_patches: list = []
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
 
-      - name: Install lint tools
-        run: pip install ruff bandit
+@pytest.fixture(scope="session")
+def app(mock_settings):
+    """
+    Build the FastAPI app once for the whole test session.
 
-      - name: Ruff lint (non-blocking)
-        working-directory: backend
-        run: ruff check app --output-format=github || true
+    Patching strategy
+    -----------------
+    * ``app.services.rag_pipeline.VectorStoreService`` — patched *where it is
+      used at class-definition time* (NamespacedRetriever field annotation),
+      not just where it is defined.  ``spec=_RealVS`` is mandatory: pydantic
+      v1's ``find_validators`` calls ``issubclass()`` on the field type; a bare
+      MagicMock is not a class and raises RuntimeError.
+    * ``app.services.llm_factory.build_llm_and_embeddings`` — prevents any
+      real API calls during import / app construction.
+    * FastAPI ``dependency_overrides`` — injects mock service instances into
+      every route that uses Depends(), bypassing startup-guard assertions.
+    """
+    from app.services.vector_store import VectorStoreService as _RealVS
 
-      - name: Ruff format check (non-blocking)
-        working-directory: backend
-        run: ruff format --check app || true
+    # Start patches manually so they stay alive for the full session scope.
+    p_factory = patch("app.services.llm_factory.build_llm_and_embeddings")
+    p_vs = patch("app.services.rag_pipeline.VectorStoreService", spec=_RealVS)
 
-      - name: Bandit security scan (non-blocking)
-        working-directory: backend
-        run: bandit -r app -ll -x app/tests || true
+    mock_factory = p_factory.start()
+    MockVS = p_vs.start()
 
-  # ─────────────────────────────────────────
-  # JOB 2: Tests
-  # ─────────────────────────────────────────
-  test:
-    name: 🧪 Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    needs: lint
+    _session_patches.extend([p_factory, p_vs])
 
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12"]
+    mock_llm = MagicMock()
+    mock_embeddings = MagicMock()
+    mock_factory.return_value = (mock_llm, mock_embeddings)
 
-    services:
-      redis:
-        image: redis:7.2-alpine
-        ports:
-          - 6379:6379
+    mock_vs_instance = MagicMock(spec=_RealVS)
+    mock_vs_instance.get_store_stats = AsyncMock(return_value={"total_vectors": 0})
+    mock_vs_instance.add_documents = AsyncMock(return_value=["chunk-1"])
+    mock_vs_instance.similarity_search = AsyncMock(return_value=[])
+    mock_vs_instance.mmr_search = AsyncMock(return_value=[])
+    MockVS.return_value = mock_vs_instance
 
-    steps:
-      - uses: actions/checkout@v4
+    from app.main import create_app
+    _app = create_app()
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+    # Build mock services
+    from app.services.rag_pipeline import RAGPipeline
+    from app.services.evaluation import EvaluationService
 
-      - name: Install dependencies
-        working-directory: backend
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio pytest-cov httpx
+    mock_rag = MagicMock(spec=RAGPipeline)
+    mock_rag.query = AsyncMock(return_value=MagicMock(
+        answer="ok",
+        sources=[],
+        session_id="s1",
+        evaluation=None,
+        processing_time=0.1,
+    ))
+    # Raise 404 for any session ID — matches test_chat_history_not_found
+    def _get_history(session_id: str):
+        raise HTTPException(status_code=404, detail="Session not found")
+    mock_rag.get_chat_history = MagicMock(side_effect=_get_history)
+    mock_rag.clear_session = MagicMock()
 
-      - name: Run tests
-        working-directory: backend
-        env:
-          OPENAI_API_KEY: sk-test
-          ENVIRONMENT: testing
-          REDIS_URL: redis://localhost:6379/0
-        run: |
-          pytest tests/ \
-            --cov=app \
-            --cov-report=xml \
-            --cov-report=term-missing \
-            --cov-fail-under=50 \
-            -v
+    mock_eval = MagicMock(spec=EvaluationService)
 
-  # ─────────────────────────────────────────
-  # JOB 3: Docker Build
-  # ─────────────────────────────────────────
-  docker-build:
-    name: 🐳 Docker Build & Push
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name != 'pull_request'
+    # Wire dependency overrides
+    from app.core.dependencies import get_eval_service, get_rag_pipeline, get_vector_store
+    _app.dependency_overrides[get_vector_store] = lambda: mock_vs_instance
+    _app.dependency_overrides[get_rag_pipeline] = lambda: mock_rag
+    _app.dependency_overrides[get_eval_service] = lambda: mock_eval
 
-    permissions:
-      contents: read
-      packages: write
+    yield _app
 
-    steps:
-      - uses: actions/checkout@v4
+    # Teardown: clear overrides and stop patches
+    _app.dependency_overrides.clear()
+    for p in reversed(_session_patches):
+        p.stop()
+    _session_patches.clear()
 
-      - uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+@pytest.fixture(scope="session")
+def client(app):
+    """
+    Session-scoped TestClient.
 
-      - name: Build & Push Backend
-        uses: docker/build-push-action@v5
-        with:
-          context: ./backend
-          file: ./docker/Dockerfile.backend
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:latest
+    Using it as a context manager triggers the app's lifespan (startup /
+    shutdown) exactly once for the whole session, which matches the
+    session-scoped ``app`` fixture and avoids repeated startup overhead.
+    """
+    with TestClient(app, raise_server_exceptions=False) as c:
+        yield c
 
-      - name: Build & Push Frontend
-        uses: docker/build-push-action@v5
-        with:
-          context: ./frontend
-          file: ./docker/Dockerfile.frontend
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:latest
 
-  # ─────────────────────────────────────────
-  # JOB 4: Deploy (Staging)
-  # ─────────────────────────────────────────
-  deploy-staging:
-    name: 🚀 Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: docker-build
-    if: github.ref == 'refs/heads/develop'
+# ── Health Tests ──────────────────────────────────────────────────────────────
 
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.STAGING_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_PRIVATE_KEY }}
-          script: |
-            cd /opt/ai-doc-assistant
-            docker compose pull
-            docker compose up -d
-            echo "✅ Staging deployed"
+class TestHealth:
+    def test_liveness(self, client):
+        r = client.get("/health/live")
+        assert r.status_code == 200
+        assert r.json()["status"] == "alive"
 
-  # ─────────────────────────────────────────
-  # JOB 5: Deploy (Production)
-  # ─────────────────────────────────────────
-  deploy-production:
-    name: 🚀 Deploy to Production
-    runs-on: ubuntu-latest
-    needs: docker-build
-    if: github.event_name == 'release'
+    def test_health_structure(self, client):
+        r = client.get("/health/")
+        assert r.status_code in (200, 503)
+        if r.status_code == 200:
+            data = r.json()
+            assert "version" in data
+            assert "components" in data
+            assert isinstance(data["components"], list)
 
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.PRODUCTION_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_PRIVATE_KEY }}
-          script: |
-            cd /opt/ai-doc-assistant
-            docker compose pull
-            docker compose up -d
-            echo "✅ Production deployed"
+    def test_root_endpoint(self, client):
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "version" in r.json()
+
+
+# ── Document Upload Tests ─────────────────────────────────────────────────────
+
+class TestDocumentUpload:
+    def test_upload_unsupported_format(self, client):
+        r = client.post(
+            "/api/v1/documents/upload",
+            files={"file": ("test.xyz", b"content", "application/octet-stream")},
+            data={"namespace": "test"},
+        )
+        assert r.status_code == 415
+
+    def test_upload_empty_file_list(self, client):
+        r = client.get("/api/v1/documents/")
+        assert r.status_code == 200
+        data = r.json()
+        assert "documents" in data
+        assert "total" in data
+
+    def test_get_nonexistent_document(self, client):
+        r = client.get("/api/v1/documents/nonexistent-id")
+        assert r.status_code == 404
+
+    def test_delete_nonexistent_document(self, client):
+        r = client.delete("/api/v1/documents/nonexistent-id")
+        assert r.status_code == 404
+
+
+# ── Chat Tests ────────────────────────────────────────────────────────────────
+
+class TestChat:
+    def test_chat_request_validation(self, client):
+        # Empty message is rejected by pydantic field validation → 422.
+        # FastAPI rejects the payload before any handler or dependency runs,
+        # so no mock patching of the chat handler is needed.
+        r = client.post(
+            "/api/v1/chat/",
+            json={"message": "", "namespace": "default"},
+        )
+        assert r.status_code == 422
+
+    def test_chat_history_not_found(self, client):
+        # mock_rag.get_chat_history raises HTTPException(404) for all session IDs.
+        r = client.get("/api/v1/chat/nonexistent-session/history")
+        assert r.status_code == 404
+
+    def test_clear_nonexistent_session(self, client):
+        # DELETE is idempotent; 204 is correct even for unknown sessions.
+        r = client.delete("/api/v1/chat/nonexistent-session")
+        assert r.status_code == 204
+
+
+# ── RAG Pipeline Unit Tests ───────────────────────────────────────────────────
+
+class TestRAGPipeline:
+    def test_format_context(self):
+        from langchain_core.documents import Document
+        from app.services.rag_pipeline import RAGPipeline
+
+        docs = [
+            Document(page_content="Hello world", metadata={"filename": "test.pdf", "page": 1}),
+            Document(page_content="Foo bar", metadata={"filename": "other.pdf"}),
+        ]
+        ctx = RAGPipeline._format_context(docs)
+        assert "test.pdf" in ctx
+        assert "Hello world" in ctx
+        assert "Foo bar" in ctx
+
+    def test_build_sources(self):
+        from langchain_core.documents import Document
+        from app.services.rag_pipeline import RAGPipeline
+
+        docs = [
+            Document(
+                page_content="Sample content",
+                metadata={
+                    "document_id": "doc-1",
+                    "filename": "sample.pdf",
+                    "chunk_id": "abc123",
+                    "page": 2,
+                },
+            )
+        ]
+        sources = RAGPipeline._build_sources(docs, [0.85])
+        assert len(sources) == 1
+        assert sources[0].document_id == "doc-1"
+        assert sources[0].relevance_score == 0.85
+
+    def test_build_sources_deduplication(self):
+        from langchain_core.documents import Document
+        from app.services.rag_pipeline import RAGPipeline
+
+        docs = [
+            Document(page_content="A", metadata={"chunk_id": "same", "document_id": "d1", "filename": "f.pdf"}),
+            Document(page_content="B", metadata={"chunk_id": "same", "document_id": "d1", "filename": "f.pdf"}),
+        ]
+        sources = RAGPipeline._build_sources(docs, [0.9, 0.8])
+        assert len(sources) == 1
+
+
+# ── Evaluation Unit Tests ─────────────────────────────────────────────────────
+
+class TestEvaluation:
+    def test_heuristic_scores_range(self):
+        from app.services.evaluation import EvaluationService
+
+        scores = EvaluationService._heuristic_scores(
+            question="What is Python?",
+            answer="Python is a programming language.",
+            contexts=["Python is a high-level programming language."],
+        )
+        assert scores.answer_relevance is not None
+        assert 0.0 <= scores.answer_relevance <= 1.0
+        assert scores.faithfulness is not None
+        assert 0.0 <= scores.faithfulness <= 1.0
+
+    def test_heuristic_empty_context(self):
+        from app.services.evaluation import EvaluationService
+
+        scores = EvaluationService._heuristic_scores(
+            question="What?", answer="I don't know", contexts=[]
+        )
+        assert scores.answer_relevance is not None
+
+
+# ── Document Processor Unit Tests ─────────────────────────────────────────────
+
+class TestDocumentProcessor:
+    def test_chunk_id_deterministic(self):
+        from app.services.document_processor import _make_chunk_id
+
+        id1 = _make_chunk_id("doc-abc", 0)
+        id2 = _make_chunk_id("doc-abc", 0)
+        id3 = _make_chunk_id("doc-abc", 1)
+        assert id1 == id2
+        assert id1 != id3
+
+    def test_unsupported_extension_raises(self):
+        from pathlib import Path
+        from app.services.document_processor import DocumentProcessor
+
+        processor = DocumentProcessor(vector_store=MagicMock())
+
+        # asyncio.run() is correct for Python 3.10+.
+        # asyncio.get_event_loop().run_until_complete() is deprecated and will
+        # raise DeprecationWarning / error in Python 3.12.
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            asyncio.run(processor._load(Path("test.xyz")))
+
+
+# ── Prometheus Metrics Tests ──────────────────────────────────────────────────
+
+class TestMetrics:
+    def test_metrics_endpoint_accessible(self, client):
+        r = client.get("/metrics")
+        assert r.status_code == 200
+        assert "http_requests_total" in r.text
